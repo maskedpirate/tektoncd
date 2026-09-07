@@ -169,16 +169,26 @@ info "Deploying Traefik with Gateway API support..."
 helm repo add traefik https://traefik.github.io/charts --force-update
 helm repo update
 
-helm upgrade --install traefik traefik/traefik \
+
+cat <<EOF | helm upgrade --install traefik traefik/traefik \
   --namespace traefik \
   --create-namespace \
-  --set experimental.kubernetesGateway.enabled=true \
-  --set ports.web.hostPort=80 \
-  --set ports.websecure.hostPort=443 \
-  --set nodeSelector."ingress-ready"="yes" \
-  --set tolerations[0].key="node-role.kubernetes.io/control-plane" \
-  --set tolerations[0].operator="Exists" \
-  --set tolerations[0].effect="NoSchedule"
+  -f -
+providers:
+  kubernetesGateway:
+    enabled: true
+ports:
+  web:
+    hostPort: 80
+  websecure:
+    hostPort: 443
+nodeSelector:
+  ingress-ready: "yes"
+tolerations:
+  - key: "node-role.kubernetes.io/control-plane"
+    operator: "Exists"
+    effect: "NoSchedule"
+EOF
 
 info "Waiting for Traefik to be ready..."
 kubectl wait --namespace traefik \
