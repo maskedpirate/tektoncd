@@ -1,0 +1,52 @@
+# UI for the local docker registry (registry:2 running as a plain container,
+# bridged into the cluster as local-registry.default.svc.cluster.local:5000).
+# joxit/docker-registry-ui bundles an nginx reverse proxy so the browser only
+# ever talks to this Service's own origin -- it proxies /v2/* to the registry
+# server-side, which avoids needing CORS headers on the registry itself.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry-ui
+  namespace: default
+  labels:
+    app: registry-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: registry-ui
+  template:
+    metadata:
+      labels:
+        app: registry-ui
+    spec:
+      containers:
+        - name: registry-ui
+          image: joxit/docker-registry-ui:latest
+          ports:
+            - containerPort: 80
+          env:
+            - name: SINGLE_REGISTRY
+              value: "true"
+            - name: REGISTRY_TITLE
+              value: "Local Registry"
+            - name: DELETE_IMAGES
+              value: "true"
+            - name: SHOW_CONTENT_DIGEST
+              value: "true"
+            - name: SHOW_CATALOG_NB_TAGS
+              value: "true"
+            - name: NGINX_PROXY_PASS_URL
+              value: "http://local-registry.default.svc.cluster.local:5000"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry-ui
+  namespace: default
+spec:
+  selector:
+    app: registry-ui
+  ports:
+    - port: 80
+      targetPort: 80

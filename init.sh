@@ -110,6 +110,7 @@ if [ "${running}" != 'true' ]; then
     -p "${reg_port}:5000" \
     --network kind \
     --name "${reg_name}" \
+    -e REGISTRY_STORAGE_DELETE_ENABLED=true \
     registry:2
 fi
 info "Registry ready..."
@@ -320,7 +321,13 @@ subsets:
       - port: 5000
 EOF
 
-# 11. Install Gitea (in-cluster git host, used to trigger pipelines via webhook)
+# 11. Deploy a UI for the local registry (registry.lab.devkit)
+info "Deploying registry UI..."
+kubectl apply -f "$(dirname "$0")/registry-ui/registry-ui.yaml"
+kubectl apply -f "$(dirname "$0")/registry-ui/httproute.yaml"
+kubectl rollout status deployment/registry-ui -n default --timeout=120s
+
+# 12. Install Gitea (in-cluster git host, used to trigger pipelines via webhook)
 info "Installing Gitea..."
 helm repo add gitea-charts https://dl.gitea.com/charts/ >/dev/null
 helm repo update gitea-charts >/dev/null
@@ -329,7 +336,10 @@ kubectl create namespace gitea --dry-run=client -o yaml | kubectl apply -f - >/d
 
 if ! kubectl get secret gitea-admin-secret -n gitea >/dev/null 2>&1; then
   info "Generating Gitea admin credentials (secret gitea-admin-secret in ns gitea)..."
-  GITEA_ADMIN_PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)
+  # openssl rand is a bounded generator, unlike /dev/urandom -- piping the
+  # latter into `head -c` sends the upstream a SIGPIPE that `set -o
+  # pipefail` treats as the whole pipeline failing.
+  GITEA_ADMIN_PASSWORD=$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 20)
   kubectl create secret generic gitea-admin-secret -n gitea \
     --from-literal=username=gitea_admin \
     --from-literal=password="${GITEA_ADMIN_PASSWORD}" \
@@ -351,7 +361,7 @@ helm upgrade --install gitea gitea-charts/gitea \
 info "Creating HTTPRoute for Gitea (gitea.lab.devkit)..."
 kubectl apply -f "$(dirname "$0")/gitea/httproute.yaml"
 
-# 12. Install the hello-world Tasks/Pipelines and the Gitea -> Tekton Triggers wiring
+# 13. Install the hello-world Tasks/Pipelines and the Gitea -> Tekton Triggers wiring
 info "Applying hello-world Task/Pipeline (trivial echo example)..."
 kubectl apply -f "$(dirname "$0")/pipelines/hello-world/hello-task.yaml"
 kubectl apply -f "$(dirname "$0")/pipelines/hello-world/hello-pipeline.yaml"
@@ -366,7 +376,7 @@ kubectl apply -f "$(dirname "$0")/triggers/gitea-trigger.yaml"
 info "Waiting for the Gitea EventListener to be ready..."
 kubectl wait --for=condition=ready pod -l eventlistener=gitea-listener -n default --timeout=180s
 
-# 13. Bootstrap a Gitea org/repo and an org-level webhook pointed at the EventListener
+# 14. Bootstrap a Gitea org/repo and an org-level webhook pointed at the EventListener
 GITEA_AUTH="gitea_admin:${GITEA_ADMIN_PASSWORD}"
 GITEA_ORG="tekton-lab"
 GITEA_REPO="hello-world"
@@ -417,6 +427,7 @@ info "Setup complete!"
 info "Envoy Gateway listening on static IP: ${CONTROL_PLANE_STATIC_IP}:80"
 info "Tekton Dashboard routed to: http://tekton.lab.devkit"
 info "Gitea routed to: http://gitea.lab.devkit (user: gitea_admin / password: ${GITEA_ADMIN_PASSWORD})"
+info "Registry UI routed to: http://registry.lab.devkit"
 info "Gitea org/repo: ${GITEA_ORG}/${GITEA_REPO} -- push to 'main' fires the org webhook -> gitea-listener -> hello-world-ci-pipeline (git-clone, mvn build, mvn test, kaniko build+push to local-registry.default.svc.cluster.local:5000/hello-world)"
 info "Ensure dnsmasq contains: 'address=/devkit/${CONTROL_PLANE_STATIC_IP}'"
 info "To use kubectl in your current shell: export KUBECONFIG=${KUBECONFIG}"
