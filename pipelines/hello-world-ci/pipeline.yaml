@@ -1,0 +1,52 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: hello-world-ci-pipeline
+  namespace: default
+spec:
+  params:
+    - name: git-repo-url
+    - name: git-revision
+      default: "main"
+    - name: image
+  workspaces:
+    - name: source
+    - name: git-credentials
+  tasks:
+    - name: fetch-source
+      taskRef:
+        name: git-clone
+      params:
+        - name: url
+          value: $(params.git-repo-url)
+        - name: revision
+          value: $(params.git-revision)
+      workspaces:
+        - name: source
+          workspace: source
+        - name: git-credentials
+          workspace: git-credentials
+    - name: build
+      runAfter: ["fetch-source"]
+      taskRef:
+        name: maven-build
+      workspaces:
+        - name: source
+          workspace: source
+    - name: test
+      runAfter: ["build"]
+      taskRef:
+        name: maven-test
+      workspaces:
+        - name: source
+          workspace: source
+    - name: build-and-push-image
+      runAfter: ["test"]
+      taskRef:
+        name: kaniko-build-push
+      params:
+        - name: image
+          value: $(params.image)
+      workspaces:
+        - name: source
+          workspace: source

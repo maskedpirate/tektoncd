@@ -1,0 +1,72 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: gitea-push-binding
+  namespace: default
+spec:
+  params:
+    - name: git-repo-url
+      value: $(body.repository.clone_url)
+    - name: git-revision
+      value: $(body.after)
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: gitea-push-template
+  namespace: default
+spec:
+  params:
+    - name: git-repo-url
+    - name: git-revision
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: hello-world-ci-run-
+        labels:
+          triggered-by: gitea-webhook
+        annotations:
+          gitea.io/repo-url: $(tt.params.git-repo-url)
+          gitea.io/revision: $(tt.params.git-revision)
+      spec:
+        pipelineRef:
+          name: hello-world-ci-pipeline
+        params:
+          - name: git-repo-url
+            value: $(tt.params.git-repo-url)
+          - name: git-revision
+            value: $(tt.params.git-revision)
+          - name: image
+            value: local-registry.default.svc.cluster.local:5000/hello-world:$(tt.params.git-revision)
+        workspaces:
+          - name: source
+            volumeClaimTemplate:
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                resources:
+                  requests:
+                    storage: 1Gi
+          - name: git-credentials
+            secret:
+              secretName: gitea-credentials
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: gitea-listener
+  namespace: default
+spec:
+  serviceAccountName: tekton-triggers-eventlistener-sa
+  triggers:
+    - name: gitea-push
+      interceptors:
+        - ref:
+            name: "cel"
+          params:
+            - name: "filter"
+              value: "header.match('X-Gitea-Event', 'push')"
+      bindings:
+        - ref: gitea-push-binding
+      template:
+        ref: gitea-push-template

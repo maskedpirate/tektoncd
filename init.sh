@@ -13,6 +13,7 @@ declare CLUSTER_NAME STATIC_IP DOCKER_SUBNET
 # - kind
 # - kubectl
 # - helm
+# - jq
 
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
   echo "This script is not intended to be sourced. Please run it as ./init.sh"
@@ -288,9 +289,135 @@ kubectl wait --namespace envoy-gateway-system \
   --selector=gateway.envoyproxy.io/owning-gateway-name=devkit-gateway \
   --timeout=180s
 
+# 10. Bridge the host-side local registry container into the cluster as a
+# stable Kubernetes Service, so in-cluster pods (kaniko) can push to it by a
+# resolvable DNS name. The registry is a plain docker container, not a k8s
+# object, so pods can't resolve its bare hostname via cluster DNS (ndots
+# search-domain rules never fall through to a plain single-label name) --
+# an Endpoints object pointing at its container IP works around that.
+info "Wiring local registry into the cluster as local-registry.default.svc.cluster.local..."
+REGISTRY_IP=$("$CONTAINER_RUNTIME" inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' "${reg_name}")
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: local-registry
+  namespace: default
+spec:
+  ports:
+    - port: 5000
+      targetPort: 5000
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: local-registry
+  namespace: default
+subsets:
+  - addresses:
+      - ip: ${REGISTRY_IP}
+    ports:
+      - port: 5000
+EOF
+
+# 11. Install Gitea (in-cluster git host, used to trigger pipelines via webhook)
+info "Installing Gitea..."
+helm repo add gitea-charts https://dl.gitea.com/charts/ >/dev/null
+helm repo update gitea-charts >/dev/null
+
+kubectl create namespace gitea --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+if ! kubectl get secret gitea-admin-secret -n gitea >/dev/null 2>&1; then
+  info "Generating Gitea admin credentials (secret gitea-admin-secret in ns gitea)..."
+  GITEA_ADMIN_PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)
+  kubectl create secret generic gitea-admin-secret -n gitea \
+    --from-literal=username=gitea_admin \
+    --from-literal=password="${GITEA_ADMIN_PASSWORD}" \
+    --from-literal=email=gitea@lab.devkit
+fi
+GITEA_ADMIN_PASSWORD=$(kubectl get secret gitea-admin-secret -n gitea -o jsonpath='{.data.password}' | base64 -d)
+
+# Mirror the admin credentials into the default namespace so Tekton Task
+# workspaces there (git-clone) can mount them -- Secrets don't cross namespaces.
+kubectl get secret gitea-admin-secret -n gitea -o json | \
+  jq '{apiVersion, kind, type, data, metadata: {name: "gitea-credentials", namespace: "default"}}' | \
+  kubectl apply -f - >/dev/null
+
+helm upgrade --install gitea gitea-charts/gitea \
+  --namespace gitea \
+  -f "$(dirname "$0")/gitea/values.yaml" \
+  --wait --timeout 5m
+
+info "Creating HTTPRoute for Gitea (gitea.lab.devkit)..."
+kubectl apply -f "$(dirname "$0")/gitea/httproute.yaml"
+
+# 12. Install the hello-world Tasks/Pipelines and the Gitea -> Tekton Triggers wiring
+info "Applying hello-world Task/Pipeline (trivial echo example)..."
+kubectl apply -f "$(dirname "$0")/pipelines/hello-world/hello-task.yaml"
+kubectl apply -f "$(dirname "$0")/pipelines/hello-world/hello-pipeline.yaml"
+
+info "Applying hello-world-ci Tasks/Pipeline (git-clone, maven build/test, kaniko build+push)..."
+kubectl apply -f "$(dirname "$0")/pipelines/hello-world-ci/"
+
+info "Applying EventListener RBAC and Gitea trigger (TriggerBinding/TriggerTemplate/EventListener)..."
+kubectl apply -f "$(dirname "$0")/triggers/rbac.yaml"
+kubectl apply -f "$(dirname "$0")/triggers/gitea-trigger.yaml"
+
+info "Waiting for the Gitea EventListener to be ready..."
+kubectl wait --for=condition=ready pod -l eventlistener=gitea-listener -n default --timeout=180s
+
+# 13. Bootstrap a Gitea org/repo and an org-level webhook pointed at the EventListener
+GITEA_AUTH="gitea_admin:${GITEA_ADMIN_PASSWORD}"
+GITEA_ORG="tekton-lab"
+GITEA_REPO="hello-world"
+EL_URL="http://el-gitea-listener.default.svc.cluster.local:8080/"
+
+info "Ensuring Gitea org '${GITEA_ORG}' exists..."
+curl -s -u "${GITEA_AUTH}" -H "Host: gitea.lab.devkit" -H "Content-Type: application/json" \
+  -d "{\"username\":\"${GITEA_ORG}\",\"visibility\":\"private\"}" \
+  "http://${CONTROL_PLANE_STATIC_IP}/api/v1/orgs" >/dev/null
+
+info "Ensuring Gitea repo '${GITEA_ORG}/${GITEA_REPO}' exists..."
+curl -s -u "${GITEA_AUTH}" -H "Host: gitea.lab.devkit" -H "Content-Type: application/json" \
+  -d "{\"name\":\"${GITEA_REPO}\",\"auto_init\":true,\"default_branch\":\"main\"}" \
+  "http://${CONTROL_PLANE_STATIC_IP}/api/v1/orgs/${GITEA_ORG}/repos" >/dev/null
+
+info "Seeding Gitea repo with sample-repos/hello-world (skipped if already seeded)..."
+already_seeded=$(curl -s -o /dev/null -w '%{http_code}' -u "${GITEA_AUTH}" -H "Host: gitea.lab.devkit" \
+  "http://${CONTROL_PLANE_STATIC_IP}/api/v1/repos/${GITEA_ORG}/${GITEA_REPO}/contents/pom.xml")
+if [ "${already_seeded}" != "200" ]; then
+  SEED_DIR=$(mktemp -d)
+  cp -r "$(dirname "$0")/sample-repos/hello-world/." "${SEED_DIR}/"
+  AUTH_HEADER="Authorization: Basic $(printf '%s' "${GITEA_AUTH}" | base64 -w0)"
+  git -C "${SEED_DIR}" init -q -b main
+  git -C "${SEED_DIR}" -c user.email="tekton-lab@lab.devkit" -c user.name="tekton-lab-bootstrap" add -A
+  git -C "${SEED_DIR}" -c user.email="tekton-lab@lab.devkit" -c user.name="tekton-lab-bootstrap" \
+    commit -q -m "Seed hello-world Spring Boot app"
+  git -C "${SEED_DIR}" remote add origin "http://gitea.lab.devkit/${GITEA_ORG}/${GITEA_REPO}.git"
+  git -C "${SEED_DIR}" -c http.extraHeader="${AUTH_HEADER}" fetch origin main -q
+  git -C "${SEED_DIR}" -c user.email="tekton-lab@lab.devkit" -c user.name="tekton-lab-bootstrap" \
+    merge origin/main --allow-unrelated-histories -q -m "Merge initial Gitea README"
+  git -C "${SEED_DIR}" -c http.extraHeader="${AUTH_HEADER}" push origin HEAD:main
+  rm -rf "${SEED_DIR}"
+else
+  info "Gitea repo already has sample content; leaving it alone."
+fi
+
+info "Ensuring org webhook -> EventListener exists..."
+existing_hook_id=$(curl -s -u "${GITEA_AUTH}" -H "Host: gitea.lab.devkit" \
+  "http://${CONTROL_PLANE_STATIC_IP}/api/v1/orgs/${GITEA_ORG}/hooks" | \
+  jq -r --arg url "${EL_URL}" '.[] | select(.config.url == $url) | .id' | head -1)
+if [ -z "${existing_hook_id}" ]; then
+  curl -s -u "${GITEA_AUTH}" -H "Host: gitea.lab.devkit" -H "Content-Type: application/json" \
+    -d "{\"type\":\"gitea\",\"config\":{\"url\":\"${EL_URL}\",\"content_type\":\"json\"},\"events\":[\"push\"],\"active\":true}" \
+    "http://${CONTROL_PLANE_STATIC_IP}/api/v1/orgs/${GITEA_ORG}/hooks" >/dev/null
+fi
+
 info "Setup complete!"
 info "Envoy Gateway listening on static IP: ${CONTROL_PLANE_STATIC_IP}:80"
 info "Tekton Dashboard routed to: http://tekton.lab.devkit"
+info "Gitea routed to: http://gitea.lab.devkit (user: gitea_admin / password: ${GITEA_ADMIN_PASSWORD})"
+info "Gitea org/repo: ${GITEA_ORG}/${GITEA_REPO} -- push to 'main' fires the org webhook -> gitea-listener -> hello-world-ci-pipeline (git-clone, mvn build, mvn test, kaniko build+push to local-registry.default.svc.cluster.local:5000/hello-world)"
 info "Ensure dnsmasq contains: 'address=/devkit/${CONTROL_PLANE_STATIC_IP}'"
 info "To use kubectl in your current shell: export KUBECONFIG=${KUBECONFIG}"
 

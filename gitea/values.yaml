@@ -1,0 +1,42 @@
+# Minimal single-pod Gitea for the lab cluster: sqlite instead of the
+# bundled postgresql-ha, in-process cache/queue instead of the bundled
+# valkey-cluster, so `helm install` doesn't also stand up an HA database
+# cluster just to host a couple of demo repos.
+replicaCount: 1
+
+persistence:
+  enabled: true
+  size: 2Gi
+
+postgresql:
+  enabled: false
+postgresql-ha:
+  enabled: false
+valkey-cluster:
+  enabled: false
+
+service:
+  http:
+    type: ClusterIP
+    port: 3000
+
+gitea:
+  admin:
+    username: gitea_admin
+    existingSecret: gitea-admin-secret
+    passwordMode: keepUpdated
+  config:
+    database:
+      DB_TYPE: sqlite3
+    session:
+      PROVIDER: memory
+    cache:
+      ADAPTER: memory
+    queue:
+      TYPE: level
+    server:
+      DOMAIN: gitea.lab.devkit
+      ROOT_URL: http://gitea.lab.devkit/
+      SSH_PORT: 22
+    webhook:
+      ALLOWED_HOST_LIST: "*"
