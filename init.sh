@@ -6,8 +6,7 @@ declare CLUSTER_NAME STATIC_IP DOCKER_SUBNET
 
 # This script deploys Tekton on a local kind cluster
 # It creates a kind cluster with a static IP assigned to the control plane,
-# installs the standard Kubernetes Gateway API CRDs, deploys Traefik as the Gateway provider,
-# and configures an HTTPRoute for the Tekton Dashboard.
+# installs Envoy Gateway via OCI Helm chart, and configures an HTTPRoute for the Tekton Dashboard.
 
 # Prerequisites:
 # - podman or docker (recommended 8GB memory config)
@@ -16,7 +15,7 @@ declare CLUSTER_NAME STATIC_IP DOCKER_SUBNET
 # - helm
 
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
-  echo "This script is not intended to be sourced. Please run it as ./tekton_in_kind.sh"
+  echo "This script is not intended to be sourced. Please run it as ./init.sh"
   return 1
 fi
 
@@ -32,12 +31,12 @@ info() {
 
 show-usage() {
   echo "Usage:"
-  echo "    tekton_in_kind.sh [-c cluster-name] [-i static-ip] [-s subnet] [-p pipeline-version] [-t triggers-version] [-d dashboard-version] [-k]"
-  echo "    tekton_in_kind.sh -h"
+  echo "    init.sh [-c cluster-name] [-i static-ip] [-s subnet] [-p pipeline-version] [-t triggers-version] [-d dashboard-version] [-k]"
+  echo "    init.sh -h"
   echo "        -c    KinD cluster name (default: tekton)"
   echo "        -i    Static IP for control plane (default: 172.24.0.10)"
   echo "        -s    Docker network subnet for kind (default: 172.24.0.0/16)"
-  echo "        -k    Force Docker container runtime instead of Podman"
+  echo "        -k    Force Podman container runtime instead of Docker"
   echo "        -h    Print this help message and exit"
 }
 
@@ -50,7 +49,7 @@ while getopts ":c:i:s:p:t:d:kh" opt; do
     p ) TEKTON_PIPELINE_VERSION=$OPTARG ;;
     t ) TEKTON_TRIGGERS_VERSION=$OPTARG ;;
     d ) TEKTON_DASHBOARD_VERSION=$OPTARG ;;
-    k ) CONTAINER_RUNTIME="docker" ;;
+    k ) CONTAINER_RUNTIME="podman" ;;
     h ) show-usage; exit 0 ;;
     \? ) echo "Invalid option: -$OPTARG" 1>&2; show-usage; exit 1 ;;
     : ) echo "Option -$OPTARG requires an argument" 1>&2; show-usage; exit 1 ;;
@@ -62,7 +61,12 @@ shift $((OPTIND -1))
 export KIND_CLUSTER_NAME=${CLUSTER_NAME:-"tekton"}
 CONTROL_PLANE_STATIC_IP=${STATIC_IP:-"172.24.0.10"}
 KIND_NET_SUBNET=${DOCKER_SUBNET:-"172.24.0.0/16"}
-GATEWAY_API_VERSION="v1.1.0"
+ENVOY_VERSION="1.9.1"
+
+# Setup custom kubeconfig location for this session and child commands
+KUBECONFIG_DIR="${HOME}/.kube/configs"
+mkdir -p "${KUBECONFIG_DIR}"
+export KUBECONFIG="${KUBECONFIG_DIR}/kind-${KIND_CLUSTER_NAME}.yaml"
 
 if [ -z "$TEKTON_PIPELINE_VERSION" ]; then
   TEKTON_PIPELINE_VERSION=$(get_latest_release tektoncd/pipeline)
@@ -74,10 +78,11 @@ if [ -z "$TEKTON_DASHBOARD_VERSION" ]; then
   TEKTON_DASHBOARD_VERSION=$(get_latest_release tektoncd/dashboard)
 fi
 if [ -z "$CONTAINER_RUNTIME" ]; then
-  CONTAINER_RUNTIME="podman"
+  CONTAINER_RUNTIME="docker"
 fi
 
 info "Using container runtime: $CONTAINER_RUNTIME"
+info "Target kubeconfig: $KUBECONFIG"
 
 # 1. Setup kind network with a fixed subnet if needed
 info "Checking bridge network for kind..."
@@ -111,16 +116,12 @@ info "Registry ready..."
 # 3. Create KinD Cluster
 info "Checking if kind cluster '$KIND_CLUSTER_NAME' exists..."
 export KIND_EXPERIMENTAL_PROVIDER=$CONTAINER_RUNTIME
-running_cluster=$(kind get clusters | grep -w "$KIND_CLUSTER_NAME" || true)
-
-KUBECONFIG_DIR="${HOME}/.kube/configs"
-mkdir -p "${KUBECONFIG_DIR}"
-export KUBECONFIG="${KUBECONFIG_DIR}/kind-${KIND_CLUSTER_NAME}.yaml"
+running_cluster=$(kind get clusters 2>/dev/null | grep -w "$KIND_CLUSTER_NAME" || true)
 
 if [ "${running_cluster}" != "$KIND_CLUSTER_NAME" ]; then
   info "Kind cluster '$KIND_CLUSTER_NAME' does not exist, creating..."
-  
-  cat <<EOF | kind create cluster --name "$KIND_CLUSTER_NAME" --kubeconfig "${KUBECONFIG_DIR}/kind-${KIND_CLUSTER_NAME}.yaml" --config=-
+
+  cat <<EOF | kind create cluster --image kindest/node:v1.36.1 --name "$KIND_CLUSTER_NAME" --config=-
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
@@ -141,60 +142,91 @@ containerdConfigPatches:
     endpoint = ["http://${reg_name}:${reg_port}"]
 EOF
 
-  # 4. Attach deterministic static alias IP to control plane container
-  cp_container="${KIND_CLUSTER_NAME}-control-plane"
-  info "Adding static alias IP ${CONTROL_PLANE_STATIC_IP} to ${cp_container}..."
-
-  "$CONTAINER_RUNTIME" exec "${cp_container}" bash -c \
-    "ip addr show dev eth0 | grep -q '${CONTROL_PLANE_STATIC_IP}/' || ip addr add '${CONTROL_PLANE_STATIC_IP}/16' dev eth0"
-
   info "Waiting for all cluster nodes to become ready..."
   kubectl wait --for=condition=ready node --all --timeout=600s
-
 fi
 info "Kind cluster '$KIND_CLUSTER_NAME' is running."
+
+# 4. Attach deterministic static alias IP and NAT redirect rules to control plane
+cp_container="${KIND_CLUSTER_NAME}-control-plane"
+info "Ensuring static alias IP ${CONTROL_PLANE_STATIC_IP} on ${cp_container}..."
+"$CONTAINER_RUNTIME" exec "${cp_container}" bash -c \
+  "ip addr show dev eth0 | grep -q '${CONTROL_PLANE_STATIC_IP}/' || ip addr add '${CONTROL_PLANE_STATIC_IP}/16' dev eth0"
+
+info "Ensuring port 80 -> 10080 NAT redirect inside ${cp_container}..."
+"$CONTAINER_RUNTIME" exec "${cp_container}" bash -c \
+  "iptables -t nat -C PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 10080 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 10080"
+"$CONTAINER_RUNTIME" exec "${cp_container}" bash -c \
+  "iptables -t nat -C OUTPUT -p tcp -o lo --dport 80 -j REDIRECT --to-ports 10080 2>/dev/null || iptables -t nat -A OUTPUT -p tcp -o lo --dport 80 -j REDIRECT --to-ports 10080"
 
 # Ensure registry is attached to kind network
 "$CONTAINER_RUNTIME" network connect kind "${reg_name}" >/dev/null 2>&1 || true
 
-# 5. Install Kubernetes Gateway API CRDs
-info "Installing Kubernetes Gateway API CRDs (${GATEWAY_API_VERSION})..."
-kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
-kubectl wait --for=condition=Established --timeout=60s crd/gateways.gateway.networking.k8s.io
-kubectl wait --for=condition=Established --timeout=60s crd/httproutes.gateway.networking.k8s.io
-
-
-# 6. Deploy Traefik via Helm with Gateway API enabled
-info "Deploying Traefik with Gateway API support..."
-helm repo add traefik https://traefik.github.io/charts --force-update
-helm repo update
-
-
-cat <<EOF | helm upgrade --install traefik traefik/traefik \
-  --namespace traefik \
+# 5. Install Envoy Gateway via OCI registry
+info "Deploying Envoy Gateway..."
+cat <<EOF | helm upgrade --install eg oci://docker.io/envoyproxy/gateway-helm \
+  --version "v${ENVOY_VERSION}" \
+  --namespace envoy-gateway-system \
   --create-namespace \
   -f -
-providers:
-  kubernetesGateway:
-    enabled: true
-ports:
-  web:
-    hostPort: 80
-  websecure:
-    hostPort: 443
-nodeSelector:
-  ingress-ready: "yes"
-tolerations:
-  - key: "node-role.kubernetes.io/control-plane"
-    operator: "Exists"
-    effect: "NoSchedule"
+deployment:
+  nodeSelector:
+    ingress-ready: "yes"
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
 EOF
 
-info "Waiting for Traefik to be ready..."
-kubectl wait --namespace traefik \
+info "Waiting for Envoy Gateway controller to be ready..."
+kubectl wait --namespace envoy-gateway-system \
   --for=condition=ready pod \
-  --selector=app.kubernetes.io/name=traefik \
+  --selector=control-plane=envoy-gateway \
   --timeout=180s
+
+# 6. Configure the Proxy Data Plane via EnvoyProxy CRD
+info "Configuring EnvoyProxy data plane pinning and hostNetwork..."
+cat <<EOF | kubectl apply -f -
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: devkit-proxy-config
+  namespace: envoy-gateway-system
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyDeployment:
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              template:
+                spec:
+                  hostNetwork: true
+                  dnsPolicy: ClusterFirstWithHostNet
+        pod:
+          nodeSelector:
+            ingress-ready: "yes"
+          tolerations:
+            - key: "node-role.kubernetes.io/control-plane"
+              operator: "Exists"
+              effect: "NoSchedule"
+      envoyService:
+        type: ClusterIP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: eg
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: devkit-proxy-config
+    namespace: envoy-gateway-system
+EOF
 
 # 7. Create root Gateway resource
 info "Creating root Gateway resource (devkit-gateway)..."
@@ -205,7 +237,7 @@ metadata:
   name: devkit-gateway
   namespace: default
 spec:
-  gatewayClassName: traefik
+  gatewayClassName: eg
   listeners:
   - name: http
     protocol: HTTP
@@ -241,13 +273,24 @@ spec:
   hostnames:
   - "tekton.lab.devkit"
   rules:
-  - backendRefs:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
     - name: tekton-dashboard
       port: 9097
 EOF
 
+info "Waiting for Envoy data-plane proxy pod to be ready..."
+kubectl wait --namespace envoy-gateway-system \
+  --for=condition=ready pod \
+  --selector=gateway.envoyproxy.io/owning-gateway-name=devkit-gateway \
+  --timeout=180s
+
 info "Setup complete!"
-info "Traefik Gateway listening on static IP: ${CONTROL_PLANE_STATIC_IP}:80"
+info "Envoy Gateway listening on static IP: ${CONTROL_PLANE_STATIC_IP}:80"
 info "Tekton Dashboard routed to: http://tekton.lab.devkit"
 info "Ensure dnsmasq contains: 'address=/devkit/${CONTROL_PLANE_STATIC_IP}'"
+info "To use kubectl in your current shell: export KUBECONFIG=${KUBECONFIG}"
 
