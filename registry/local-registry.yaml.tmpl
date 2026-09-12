@@ -1,0 +1,30 @@
+# Templated with envsubst by lib/registry.sh -- $REGISTRY_IP is the
+# kind-registry container's IP on the `kind` docker network, discovered at
+# runtime since it can change whenever the container is recreated.
+#
+# This bridges a plain docker container into the cluster as a real Service.
+# Pods resolve names via CoreDNS, not Docker's embedded DNS, and a bare
+# single-label name like `kind-registry` fails cluster-DNS resolution (k8s
+# `ndots` search-domain rules never fall through to try it as an external
+# name) -- a manually-specified Endpoints object is what makes
+# local-registry.default.svc.cluster.local:5000 resolvable from pods.
+apiVersion: v1
+kind: Service
+metadata:
+  name: local-registry
+  namespace: default
+spec:
+  ports:
+    - port: 5000
+      targetPort: 5000
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: local-registry
+  namespace: default
+subsets:
+  - addresses:
+      - ip: ${REGISTRY_IP}
+    ports:
+      - port: 5000

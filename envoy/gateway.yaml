@@ -1,0 +1,16 @@
+# The single ingress point every HTTPRoute in this repo attaches to
+# (tekton.lab.devkit, gitea.lab.devkit, registry.lab.devkit).
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: devkit-gateway
+  namespace: default
+spec:
+  gatewayClassName: eg
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+    allowedRoutes:
+      namespaces:
+        from: All

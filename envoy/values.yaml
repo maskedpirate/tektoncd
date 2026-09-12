@@ -1,0 +1,10 @@
+# Pins the Envoy Gateway controller itself to the ingress-ready node (the
+# kind control-plane), matching where the EnvoyProxy CRD (envoyproxy.yaml)
+# pins the actual data-plane proxy pods.
+deployment:
+  nodeSelector:
+    ingress-ready: "yes"
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
