@@ -50,6 +50,8 @@ spec:
           - name: git-credentials
             secret:
               secretName: gitea-credentials
+          - name: maven-settings
+            emptyDir: {}
 ---
 apiVersion: triggers.tekton.dev/v1beta1
 kind: EventListener

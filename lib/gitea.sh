@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Self-hosted Gitea: lightweight (sqlite/in-memory) single-pod install via
 # the official Helm chart, exposed at gitea.lab.devkit, with admin
-# credentials generated once and mirrored into the default namespace so
-# Tekton Task workspaces there can use them (Secrets don't cross namespaces).
+# credentials generated once and turned into a git-credential-store Secret
+# in the default namespace for the catalog git-clone Task's basic-auth
+# workspace (Secrets don't cross namespaces, so this can't just reference
+# gitea-admin-secret directly).
 
 setup_gitea() {
   info "Installing Gitea..."
@@ -24,11 +26,14 @@ setup_gitea() {
   fi
   GITEA_ADMIN_PASSWORD=$(kubectl get secret gitea-admin-secret -n gitea -o jsonpath='{.data.password}' | base64 -d)
 
-  # Mirror the admin credentials into the default namespace so Tekton Task
-  # workspaces there (git-clone) can mount them.
-  kubectl get secret gitea-admin-secret -n gitea -o json | \
-    jq '{apiVersion, kind, type, data, metadata: {name: "gitea-credentials", namespace: "default"}}' | \
-    kubectl apply -f - >/dev/null
+  # Build a git-credential-store Secret in the default namespace: the
+  # catalog git-clone Task's basic-auth workspace just copies whatever
+  # `.git-credentials`/`.gitconfig` files it finds into $HOME and lets
+  # git's own credential.helper=store handle authentication from there.
+  kubectl create secret generic gitea-credentials -n default \
+    --from-literal=.git-credentials="http://gitea_admin:${GITEA_ADMIN_PASSWORD}@gitea.lab.devkit" \
+    --from-literal=.gitconfig="$(printf '[credential]\n\thelper = store\n')" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
   helm upgrade --install gitea gitea-charts/gitea \
     --namespace gitea \

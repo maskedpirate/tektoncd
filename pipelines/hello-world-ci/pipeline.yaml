@@ -1,3 +1,6 @@
+# Uses the vendored Tekton catalog Tasks in this directory (git-clone,
+# maven, buildah) instead of hand-rolled ones -- see the header comment in
+# each task-*.yaml for where they came from and what's overridden.
 apiVersion: tekton.dev/v1
 kind: Pipeline
 metadata:
@@ -12,6 +15,7 @@ spec:
   workspaces:
     - name: source
     - name: git-credentials
+    - name: maven-settings
   tasks:
     - name: fetch-source
       taskRef:
@@ -22,31 +26,53 @@ spec:
         - name: revision
           value: $(params.git-revision)
       workspaces:
-        - name: source
+        - name: output
           workspace: source
-        - name: git-credentials
+        - name: basic-auth
           workspace: git-credentials
     - name: build
       runAfter: ["fetch-source"]
       taskRef:
-        name: maven-build
+        name: maven
+      params:
+        - name: MAVEN_IMAGE
+          value: maven:3.9.9-eclipse-temurin-21
+        - name: GOALS
+          value: ["-DskipTests", "clean", "package"]
       workspaces:
         - name: source
           workspace: source
+        - name: maven-settings
+          workspace: maven-settings
+        - name: maven-local-repo
+          workspace: source
+          subPath: m2-repo
     - name: test
       runAfter: ["build"]
       taskRef:
-        name: maven-test
+        name: maven
+      params:
+        - name: MAVEN_IMAGE
+          value: maven:3.9.9-eclipse-temurin-21
+        - name: GOALS
+          value: ["test"]
       workspaces:
         - name: source
           workspace: source
+        - name: maven-settings
+          workspace: maven-settings
+        - name: maven-local-repo
+          workspace: source
+          subPath: m2-repo
     - name: build-and-push-image
       runAfter: ["test"]
       taskRef:
-        name: kaniko-build-push
+        name: buildah
       params:
-        - name: image
+        - name: IMAGE
           value: $(params.image)
+        - name: TLSVERIFY
+          value: "false"
       workspaces:
         - name: source
           workspace: source

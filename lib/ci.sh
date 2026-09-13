@@ -7,7 +7,7 @@ apply_ci_pipelines() {
   kubectl apply -f "${SCRIPT_DIR}/pipelines/hello-world/hello-task.yaml"
   kubectl apply -f "${SCRIPT_DIR}/pipelines/hello-world/hello-pipeline.yaml"
 
-  info "Applying hello-world-ci Tasks/Pipeline (git-clone, maven build/test, kaniko build+push)..."
+  info "Applying hello-world-ci Tasks/Pipeline (git-clone, maven build/test, buildah build+push)..."
   kubectl apply -f "${SCRIPT_DIR}/pipelines/hello-world-ci/"
 
   info "Applying EventListener RBAC and Gitea trigger (TriggerBinding/TriggerTemplate/EventListener)..."
